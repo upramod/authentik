@@ -584,6 +584,31 @@ class SCIMUserTests(TestCase):
         self.assertEqual(mock.request_history[1].method, "POST")
 
     @Mocker()
+    def test_user_noop_when_response_omits_attributes(self, mock: Mocker):
+        """A partial SCIM response must not force the next identical sync to write again."""
+        scim_id = generate_id()
+        mock.get("https://localhost/ServiceProviderConfig", json={})
+        mock.post("https://localhost/Users", json={"id": scim_id})
+        put_user = mock.put(f"https://localhost/Users/{scim_id}", json={"id": scim_id})
+
+        uid = generate_id()
+        user = User.objects.create(
+            username=uid,
+            name=f"{uid} {uid}",
+            email=f"{uid}@goauthentik.io",
+        )
+
+        # The create response omits writable attributes. A second identical sync
+        # must compare against what authentik wrote rather than the partial response.
+        scim_sync.send(self.provider.pk).get_result()
+        scim_sync.send(self.provider.pk).get_result()
+
+        self.assertEqual(put_user.call_count, 0)
+        connection = SCIMProviderUser.objects.get(provider=self.provider, user=user)
+        self.assertEqual(connection.attributes["userName"], uid)
+        self.assertEqual(connection.attributes["id"], scim_id)
+
+    @Mocker()
     def test_user_diff_nested_attribute(self, mock: Mocker):
         """Test nested attribute changes are detected without mutating cached data"""
         mock.get("https://localhost/ServiceProviderConfig", json={})
