@@ -8,6 +8,7 @@ from requests_mock import Mocker
 from authentik.blueprints.tests import apply_blueprint
 from authentik.core.models import Application, Group, User
 from authentik.lib.generators import generate_id
+from authentik.lib.sync.outgoing.signals import sync_outgoing_inhibit_dispatch
 from authentik.policies.models import PolicyBinding
 from authentik.providers.scim.clients.schema import ServiceProviderConfiguration
 from authentik.providers.scim.models import (
@@ -17,7 +18,7 @@ from authentik.providers.scim.models import (
     SCIMProviderGroup,
     SCIMProviderUser,
 )
-from authentik.providers.scim.tasks import scim_sync
+from authentik.providers.scim.tasks import scim_sync, scim_sync_m2m
 from authentik.tasks.models import TaskLog
 from authentik.tenants.models import Tenant
 
@@ -182,6 +183,189 @@ class SCIMMembershipTests(TestCase):
             self.assertTrue(
                 SCIMProviderUser.objects.filter(provider=self.provider, user=user).exists()
             )
+
+    def test_policy_group_removal_preserves_other_group_binding(self):
+        """Another group may still grant the user access to the application."""
+        with Mocker() as mock:
+            user, group, delete_user, remote_members = self._provision_policy_group_user(mock)
+            with sync_outgoing_inhibit_dispatch():
+                other_group = Group.objects.create(name=generate_id())
+                other_group.users.add(user)
+            PolicyBinding.objects.create(target=self.app, group=other_group, order=1)
+
+            with self.captureOnCommitCallbacks(execute=True):
+                group.users.remove(user)
+
+            self._assert_no_scim_task_errors()
+            self.assertTrue(self.provider.get_object_qs(User, pk=user.pk).exists())
+            self.assertEqual(remote_members, set())
+            self.assertEqual(delete_user.call_count, 0)
+            self.assertTrue(
+                SCIMProviderUser.objects.filter(provider=self.provider, user=user).exists()
+            )
+
+    def test_policy_group_removal_with_filtered_group(self):
+        """Group sync filters must not suppress account deprovisioning."""
+        with Mocker() as mock:
+            user, group, delete_user, _remote_members = self._provision_policy_group_user(mock)
+            with sync_outgoing_inhibit_dispatch():
+                other_group = Group.objects.create(name=generate_id())
+            self.provider.group_filters.add(other_group)
+            self.assertFalse(self.provider.get_object_qs(Group, pk=group.pk).exists())
+
+            with self.captureOnCommitCallbacks(execute=True):
+                group.users.remove(user)
+
+            self._assert_no_scim_task_errors()
+            self.assertFalse(self.provider.get_object_qs(User, pk=user.pk).exists())
+            self.assertEqual(delete_user.call_count, 1)
+            self.assertFalse(
+                SCIMProviderUser.objects.filter(provider=self.provider, user=user).exists()
+            )
+
+    def test_policy_group_removal_without_group_mapping(self):
+        """User cleanup must work even when the group has no remote mapping."""
+        with Mocker() as mock:
+            user, group, delete_user, _remote_members = self._provision_policy_group_user(mock)
+            SCIMProviderGroup.objects.filter(provider=self.provider, group=group).delete()
+
+            with self.captureOnCommitCallbacks(execute=True):
+                group.users.remove(user)
+
+            self._assert_no_scim_task_errors()
+            self.assertFalse(self.provider.get_object_qs(User, pk=user.pk).exists())
+            self.assertEqual(delete_user.call_count, 1)
+            self.assertFalse(
+                SCIMProviderUser.objects.filter(provider=self.provider, user=user).exists()
+            )
+
+    def test_policy_group_removal_remote_group_not_found(self):
+        """An absent remote group must not block cleanup of its former user."""
+        with Mocker() as mock:
+            user, group, delete_user, _remote_members = self._provision_policy_group_user(mock)
+            group_mapping = SCIMProviderGroup.objects.get(provider=self.provider, group=group)
+            mock.patch(f"https://localhost/Groups/{group_mapping.scim_id}", status_code=404)
+
+            with self.captureOnCommitCallbacks(execute=True):
+                group.users.remove(user)
+
+            self._assert_no_scim_task_errors()
+            self.assertFalse(self.provider.get_object_qs(User, pk=user.pk).exists())
+            self.assertEqual(delete_user.call_count, 1)
+            self.assertFalse(
+                SCIMProviderUser.objects.filter(provider=self.provider, user=user).exists()
+            )
+
+    def test_policy_group_removal_preserves_readded_user(self):
+        """A delayed removal event must recheck current application access."""
+        with Mocker() as mock:
+            user, group, delete_user, _remote_members = self._provision_policy_group_user(mock)
+            # Simulate the worker handling removal after the user has been re-added.
+            with sync_outgoing_inhibit_dispatch():
+                group.users.remove(user)
+                group.users.add(user)
+
+            scim_sync_m2m.send(group.pk, self.provider.pk, "post_remove", [user.pk]).get_result()
+
+            self._assert_no_scim_task_errors()
+            self.assertTrue(self.provider.get_object_qs(User, pk=user.pk).exists())
+            self.assertEqual(delete_user.call_count, 0)
+            self.assertTrue(
+                SCIMProviderUser.objects.filter(provider=self.provider, user=user).exists()
+            )
+
+    def test_policy_group_removal_only_cleans_affected_user(self):
+        """An event must not sweep unrelated out-of-scope account mappings."""
+        with Mocker() as mock:
+            user, group, delete_user, _remote_members = self._provision_policy_group_user(mock)
+            with sync_outgoing_inhibit_dispatch():
+                unrelated_user = User.objects.create(username=generate_id())
+            unrelated_id = generate_id()
+            SCIMProviderUser.objects.create(
+                provider=self.provider, user=unrelated_user, scim_id=unrelated_id
+            )
+            delete_unrelated = mock.delete(
+                f"https://localhost/Users/{unrelated_id}", status_code=204
+            )
+            self.assertFalse(self.provider.get_object_qs(User, pk=unrelated_user.pk).exists())
+
+            with self.captureOnCommitCallbacks(execute=True):
+                group.users.remove(user)
+
+            self._assert_no_scim_task_errors()
+            self.assertEqual(delete_user.call_count, 1)
+            self.assertEqual(delete_unrelated.call_count, 0)
+            self.assertTrue(
+                SCIMProviderUser.objects.filter(
+                    provider=self.provider, user=unrelated_user, scim_id=unrelated_id
+                ).exists()
+            )
+
+    def test_policy_group_removal_delete_retry(self):
+        """A failed remote delete must retain the mapping for a successful retry."""
+        with Mocker() as mock:
+            user, group, _delete_user, _remote_members = self._provision_policy_group_user(mock)
+            mapping = SCIMProviderUser.objects.get(provider=self.provider, user=user)
+            delete_user = mock.delete(
+                f"https://localhost/Users/{mapping.scim_id}",
+                [{"status_code": 429}, {"status_code": 204}],
+            )
+
+            with self.captureOnCommitCallbacks(execute=True):
+                group.users.remove(user)
+
+            self.assertFalse(self.provider.get_object_qs(User, pk=user.pk).exists())
+            self.assertEqual(delete_user.call_count, 1)
+            self.assertTrue(SCIMProviderUser.objects.filter(pk=mapping.pk).exists())
+            self.assertTrue(
+                TaskLog.objects.filter(
+                    task__actor_name=scim_sync_m2m.actor_name,
+                    event__startswith="Task has encountered an error and will be retried",
+                    previous=False,
+                ).exists()
+            )
+
+            scim_sync_m2m.send(group.pk, self.provider.pk, "post_remove", [user.pk]).get_result()
+
+            self.assertEqual(delete_user.call_count, 2)
+            self.assertFalse(SCIMProviderUser.objects.filter(pk=mapping.pk).exists())
+
+    def test_policy_group_removal_remote_user_not_found(self):
+        """A remote account that is already gone needs no further cleanup."""
+        with Mocker() as mock:
+            user, group, _delete_user, _remote_members = self._provision_policy_group_user(mock)
+            mapping = SCIMProviderUser.objects.get(provider=self.provider, user=user)
+            delete_user = mock.delete(f"https://localhost/Users/{mapping.scim_id}", status_code=404)
+
+            with self.captureOnCommitCallbacks(execute=True):
+                group.users.remove(user)
+
+            self._assert_no_scim_task_errors()
+            self.assertEqual(delete_user.call_count, 1)
+            self.assertFalse(SCIMProviderUser.objects.filter(pk=mapping.pk).exists())
+
+    def test_policy_group_removal_dry_run_preserves_mapping(self):
+        """Dry-run processing must leave both the remote account and its mapping."""
+        with Mocker() as mock:
+            user, group, delete_user, remote_members = self._provision_policy_group_user(mock)
+            mapping = SCIMProviderUser.objects.get(provider=self.provider, user=user)
+            self.provider.dry_run = True
+            self.provider.save()
+
+            with self.captureOnCommitCallbacks(execute=True):
+                group.users.remove(user)
+
+            self._assert_no_scim_task_errors()
+            self.assertFalse(self.provider.get_object_qs(User, pk=user.pk).exists())
+            self.assertEqual(delete_user.call_count, 0)
+            self.assertEqual(remote_members, {mapping.scim_id})
+            self.assertFalse(
+                any(
+                    request.method in {"POST", "PUT", "PATCH", "DELETE"}
+                    for request in mock.request_history
+                )
+            )
+            self.assertTrue(SCIMProviderUser.objects.filter(pk=mapping.pk).exists())
 
     def test_member_add(self):
         """Test member add"""
