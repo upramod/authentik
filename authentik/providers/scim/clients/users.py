@@ -91,7 +91,10 @@ class SCIMUserClient(SCIMClient[User, SCIMProviderUser, SCIMUserSchema]):
                 if not scim_id or scim_id == "":
                     raise StopSync("SCIM Response with missing or invalid `id`")
                 return SCIMProviderUser.objects.create(
-                    provider=self.provider, user=user, scim_id=scim_id, attributes=response
+                    provider=self.provider,
+                    user=user,
+                    scim_id=scim_id,
+                    attributes=scim_user.model_dump(mode="json", exclude_unset=True) | response,
                 )
 
     def diff(self, local_created: dict[str, Any], connection: SCIMProviderUser):
@@ -118,7 +121,9 @@ class SCIMUserClient(SCIMClient[User, SCIMProviderUser, SCIMUserSchema]):
             f"/Users/{connection.scim_id}",
             json=payload,
         )
-        connection.attributes = response
+        # Remember the state we attempted to write, not only what the service
+        # returned. SCIM services may omit write-only or ignored attributes.
+        connection.attributes = payload | response
         connection.save()
 
     def discover(self):
