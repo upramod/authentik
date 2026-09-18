@@ -8,14 +8,17 @@ from requests_mock import Mocker
 from authentik.blueprints.tests import apply_blueprint
 from authentik.core.models import Application, Group, User
 from authentik.lib.generators import generate_id
+from authentik.policies.models import PolicyBinding
 from authentik.providers.scim.clients.schema import ServiceProviderConfiguration
 from authentik.providers.scim.models import (
     SCIMCompatibilityMode,
     SCIMMapping,
     SCIMProvider,
     SCIMProviderGroup,
+    SCIMProviderUser,
 )
 from authentik.providers.scim.tasks import scim_sync
+from authentik.tasks.models import TaskLog
 from authentik.tenants.models import Tenant
 
 
@@ -54,6 +57,131 @@ class SCIMMembershipTests(TestCase):
         self.provider.property_mappings_group.set(
             [SCIMMapping.objects.get(managed="goauthentik.io/providers/scim/group")]
         )
+
+    def _provision_policy_group_user(self, mock: Mocker):
+        """Provision an account whose application access comes from one group."""
+        group = Group.objects.create(name=generate_id())
+        user = User.objects.create(username=generate_id())
+        group.users.add(user)
+        user_scim_id = generate_id()
+        group_scim_id = generate_id()
+        config = ServiceProviderConfiguration.default()
+        config.patch.supported = True
+        mock.get("https://localhost/ServiceProviderConfig", json=config.model_dump())
+        mock.post(
+            "https://localhost/Users",
+            json=lambda request, _context: request.json() | {"id": user_scim_id},
+        )
+        mock.post("https://localhost/Groups", json={"id": group_scim_id})
+
+        # Keep the transport double's membership independent of the local database.
+        remote_members = set()
+
+        def patch_members(request, _context):
+            for operation in request.json()["Operations"]:
+                if operation["op"] == "add":
+                    remote_members.update(member["value"] for member in operation["value"])
+                elif operation["op"] == "remove":
+                    self.assertEqual(operation["path"], f'members[value eq "{user_scim_id}"]')
+                    remote_members.discard(user_scim_id)
+                else:
+                    self.fail(f"Unexpected group operation: {operation}")
+            return {}
+
+        mock.patch(f"https://localhost/Groups/{group_scim_id}", json=patch_members)
+        mock.get(
+            f"https://localhost/Groups/{group_scim_id}",
+            json=lambda _request, _context: {
+                "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+                "id": group_scim_id,
+                "displayName": group.name,
+                "members": [{"value": member} for member in sorted(remote_members)],
+            },
+        )
+        self.configure()
+        PolicyBinding.objects.create(target=self.app, group=group, order=0)
+        scim_sync.send(self.provider.pk).get_result()
+        self.assertTrue(self.provider.get_object_qs(User, pk=user.pk).exists())
+        self.assertTrue(
+            SCIMProviderUser.objects.filter(
+                provider=self.provider, user=user, scim_id=user_scim_id
+            ).exists()
+        )
+        self.assertEqual(remote_members, {user_scim_id})
+        self._assert_no_scim_task_errors()
+        mock.reset_mock()
+        delete_user = mock.delete(f"https://localhost/Users/{user_scim_id}", status_code=204)
+        return user, group, delete_user, remote_members
+
+    def _assert_no_scim_task_errors(self):
+        """An actor failure must not look like correct account preservation."""
+        errors = TaskLog.objects.filter(
+            task__actor_name__startswith="authentik.providers.scim.tasks.",
+            log_level="error",
+            previous=False,
+        )
+        self.assertFalse(errors.exists(), list(errors.values("task__actor_name", "event")))
+
+    def _assert_policy_group_removal_deprovisions(self, reverse: bool):
+        """Exercise the real signal/task chain, with only HTTP transport mocked."""
+        with Mocker() as mock:
+            user, group, delete_user, _remote_members = self._provision_policy_group_user(mock)
+            with self.captureOnCommitCallbacks(execute=True):
+                if reverse:
+                    group.users.remove(user)
+                else:
+                    user.groups.remove(group)
+
+            self._assert_no_scim_task_errors()
+            self.assertFalse(self.provider.get_object_qs(User, pk=user.pk).exists())
+            self.assertTrue(User.objects.filter(pk=user.pk).exists())
+            self.assertEqual(
+                delete_user.call_count,
+                1,
+                "Leaving application scope must deprovision the managed SCIM account "
+                "without a manual or scheduled full sync.",
+            )
+            self.assertFalse(
+                SCIMProviderUser.objects.filter(provider=self.provider, user=user).exists()
+            )
+
+    def test_policy_group_removal_deprovisions_user(self):
+        """Removing from the group's manager must deprovision the scoped user."""
+        self._assert_policy_group_removal_deprovisions(reverse=True)
+
+    def test_policy_group_removal_from_user_deprovisions_user(self):
+        """Removing from the user's manager must also deprovision the scoped user."""
+        self._assert_policy_group_removal_deprovisions(reverse=False)
+
+    def test_policy_group_removal_manual_sync_cleanup(self):
+        """Control: a full sync can remove the same out-of-scope managed account."""
+        with Mocker() as mock:
+            user, group, delete_user, _remote_members = self._provision_policy_group_user(mock)
+            with self.captureOnCommitCallbacks(execute=True):
+                group.users.remove(user)
+            scim_sync.send(self.provider.pk).get_result()
+            self._assert_no_scim_task_errors()
+            self.assertEqual(delete_user.call_count, 1)
+            self.assertFalse(
+                SCIMProviderUser.objects.filter(provider=self.provider, user=user).exists()
+            )
+
+    def test_policy_group_removal_preserves_directly_bound_user(self):
+        """A remaining direct binding must preserve the managed account."""
+        with Mocker() as mock:
+            user, group, delete_user, remote_members = self._provision_policy_group_user(mock)
+            PolicyBinding.objects.create(target=self.app, user=user, order=1)
+            with self.captureOnCommitCallbacks(execute=True):
+                group.users.remove(user)
+            self._assert_no_scim_task_errors()
+            self.assertTrue(self.provider.get_object_qs(User, pk=user.pk).exists())
+            self.assertEqual(
+                remote_members, set(), "The membership event must reach the SCIM target."
+            )
+            self.assertEqual(delete_user.call_count, 0)
+            self.assertTrue(
+                SCIMProviderUser.objects.filter(provider=self.provider, user=user).exists()
+            )
 
     def test_member_add(self):
         """Test member add"""

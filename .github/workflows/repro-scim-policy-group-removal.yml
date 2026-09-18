@@ -1,0 +1,35 @@
+# Fork-only reproduction harness. Keep this workflow out of the upstream patch.
+name: Reproduce SCIM policy group removal
+
+on:
+  push:
+    branches:
+      - repro/scim-policy-group-removal
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scim-regression:
+    if: github.repository == 'upramod/authentik'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+        with:
+          persist-credentials: false
+      - name: Record source revision
+        run: git log -1 --format='%H %s'
+      - name: Set up the upstream Python and PostgreSQL test environment
+        uses: ./.github/actions/setup
+        with:
+          dependencies: system,python,runtime
+          postgresql_version: '16'
+      - name: Run membership regressions and application policy controls
+        env:
+          CI_TEST_SEED: '25291'
+        run: >-
+          make test
+          authentik/providers/scim/tests/test_membership.py
+          authentik/providers/scim/tests/test_application_policies.py
