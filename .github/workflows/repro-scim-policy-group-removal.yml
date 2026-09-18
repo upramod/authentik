@@ -10,6 +10,12 @@ on:
 permissions:
   contents: read
 
+env:
+  # Public test credentials used by the upstream CI compose service.
+  POSTGRES_DB: authentik
+  POSTGRES_USER: authentik
+  POSTGRES_PASSWORD: "EK-5jnKfjrGRm<77"
+
 jobs:
   scim-regression:
     if: github.repository == 'upramod/authentik'
