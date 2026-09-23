@@ -1,0 +1,81 @@
+# Validation harness for the contributor's fork.
+# Prepared with OpenAI Codex assistance; no application-code changes.
+name: Verify application cache membership invalidation
+
+on:
+  push:
+    branches:
+      - repro/application-cache-group-membership
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    if: github.repository == 'upramod/authentik'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CI_TEST_SEED: '26279'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+        with:
+          ref: 7e2c78c1e193dffe7891123d35e91072ce425ee6
+          persist-credentials: false
+      - name: Record the exact PR revision
+        run: |
+          test "$(git rev-parse HEAD)" = 7e2c78c1e193dffe7891123d35e91072ce425ee6
+          git log -1 --format='%H %s'
+      - name: Set up upstream Python and PostgreSQL 16 environment
+        uses: ./.github/actions/setup
+        with:
+          dependencies: system,python,runtime
+          postgresql_version: '16'
+      - name: Check changed Python files
+        run: |
+          uv run ruff check authentik/policies/signals.py authentik/policies/tests/test_signals.py authentik/core/tests/test_applications_api.py
+          uv run black --check authentik/policies/signals.py authentik/policies/tests/test_signals.py authentik/core/tests/test_applications_api.py
+      - name: Run application API and policy signal tests with the fix
+        run: |
+          make test authentik/core/tests/test_applications_api.py authentik/policies/tests/test_signals.py
+          cp unittest.xml green.xml
+      - name: Confirm the regression fails without the production fix
+        shell: bash
+        run: |
+          git fetch --depth=1 origin 449f299694246ecc0b9c2f1b70359aec4dd69644
+          git restore --source=449f299694246ecc0b9c2f1b70359aec4dd69644 -- authentik/policies/signals.py
+          set +e
+          uv run python manage.py test --keepdb authentik/core/tests/test_applications_api.py::TestApplicationsAPI::test_list_cache_invalidated_after_group_membership_change
+          result=$?
+          set -e
+          cp unittest.xml red.xml
+          git restore --source=HEAD -- authentik/policies/signals.py
+          test "$result" -eq 1
+          uv run python - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("red.xml").getroot()
+          cases = list(root.iter("testcase"))
+          assert len(cases) == 1, "The negative control must execute exactly one test"
+          case = cases[0]
+          assert case.attrib["name"] == "test_list_cache_invalidated_after_group_membership_change"
+          assert case.find("error") is None, "An environment/setup error is not regression proof"
+          failure = case.find("failure")
+          assert failure is not None, "The negative control must fail its assertion"
+          assert "not found in" in failure.attrib.get("message", "")
+          assert "self.assertIn(app.slug, listed_slugs())" in (failure.text or "")
+          print("Confirmed: the cached application list stays stale without the membership fix.")
+          PY
+          git diff --exit-code
+      - name: Preserve test reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: application-cache-regression-reports
+          path: |
+            green.xml
+            red.xml
+            unittest.xml
+          if-no-files-found: warn
+          retention-days: 30
