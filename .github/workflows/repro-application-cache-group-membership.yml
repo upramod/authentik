@@ -18,6 +18,10 @@ jobs:
     timeout-minutes: 30
     env:
       CI_TEST_SEED: '26279'
+      # Public credentials for the isolated upstream CI compose database.
+      POSTGRES_DB: authentik
+      POSTGRES_USER: authentik
+      POSTGRES_PASSWORD: "EK-5jnKfjrGRm<77"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
         with:
