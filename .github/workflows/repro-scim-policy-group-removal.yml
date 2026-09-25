@@ -25,6 +25,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
         with:
           persist-credentials: false
+          ref: 314049e2f123496ffeb7db8bdefc0787b7f7518d
       - name: Record source revision
         run: git log -1 --format='%H %s'
       - name: Set up the upstream Python and PostgreSQL test environment
@@ -34,8 +35,8 @@ jobs:
           postgresql_version: '16'
       - name: Check changed Python files
         run: |
-          uv run ruff check authentik/providers/scim/tasks.py authentik/providers/scim/clients/users.py authentik/providers/scim/tests/test_membership.py authentik/providers/scim/tests/test_user.py
-          uv run black --check authentik/providers/scim/tasks.py authentik/providers/scim/clients/users.py authentik/providers/scim/tests/test_membership.py authentik/providers/scim/tests/test_user.py
+          uv run ruff check authentik/lib/sync/outgoing/tasks.py authentik/providers/scim/clients/users.py authentik/providers/scim/tests/test_membership.py authentik/providers/scim/tests/test_user.py
+          uv run black --check authentik/lib/sync/outgoing/tasks.py authentik/providers/scim/clients/users.py authentik/providers/scim/tests/test_membership.py authentik/providers/scim/tests/test_user.py
       - name: Run the full SCIM provider test suite
         env:
           CI_TEST_SEED: '25291'
