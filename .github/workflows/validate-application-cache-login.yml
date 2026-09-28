@@ -71,7 +71,7 @@ jobs:
       - name: Run candidate core regression modules
         run: |
           set -o pipefail
-          make test authentik.core.tests.test_signals authentik.core.tests.test_applications_api 2>&1 | tee evidence/candidate.log
+          make test authentik/core/tests/test_signals.py authentik/core/tests/test_applications_api.py 2>&1 | tee evidence/candidate.log
       - name: Save provenance
         if: always()
         run: |
