@@ -27,6 +27,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p evidence
+          git fetch --depth=1 origin 53d94213e87e32387fad93308713eae0f4711685
           git show 53d94213e87e32387fad93308713eae0f4711685:authentik/core/api/applications.py > authentik/core/api/applications.py
           git show 53d94213e87e32387fad93308713eae0f4711685:authentik/core/signals.py > authentik/core/signals.py
           uv run python - <<'PY'
