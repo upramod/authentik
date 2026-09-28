@@ -1,0 +1,68 @@
+name: Validate application cache login
+on:
+  push:
+    branches: [validation/application-cache-login-20260928]
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      POSTGRES_DB: authentik
+      POSTGRES_USER: authentik
+      POSTGRES_PASSWORD: "EK-5jnKfjrGRm<77"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+      - uses: ./.github/actions/setup
+        with:
+          dependencies: python,runtime
+      - name: Check formatting and lint
+        run: |
+          uv run black --check authentik/core/api/applications.py authentik/core/signals.py authentik/core/tests/test_applications_api.py authentik/core/tests/test_signals.py
+          uv run ruff check authentik/core/api/applications.py authentik/core/signals.py authentik/core/tests/test_applications_api.py authentik/core/tests/test_signals.py
+      - name: Verify baseline regressions
+        shell: bash
+        run: |
+          mkdir -p evidence
+          git show 53d94213e87e32387fad93308713eae0f4711685:authentik/core/api/applications.py > authentik/core/api/applications.py
+          git show 53d94213e87e32387fad93308713eae0f4711685:authentik/core/signals.py > authentik/core/signals.py
+          uv run python - <<'PY'
+          import json, pathlib, subprocess
+          cases = [
+              ("authentik.core.tests.test_signals.TestLoginApplicationCache.test_login_invalidates_application_pages", "'cached' is not None"),
+              ("authentik.core.tests.test_applications_api.TestApplicationCacheLogin.test_group_removal_is_visible_after_login", "unexpectedly found in"),
+              ("authentik.core.tests.test_applications_api.TestApplicationCacheLogin.test_application_list_cache_duration", "86400 != 300"),
+          ]
+          results = []
+          for case, marker in cases:
+              run = subprocess.run(["uv", "run", "python", "manage.py", "test", "--keepdb", "--noinput", case], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              pathlib.Path("evidence", case.rsplit(".", 1)[-1] + "-baseline.log").write_text(run.stdout)
+              valid = run.returncode == 1 and marker in run.stdout and "FAIL: " in run.stdout and "FAILED (failures=1)" in run.stdout and "ERROR:" not in run.stdout
+              results.append(dict(test=case, returncode=run.returncode, expected_failure=valid))
+              print(case, "expected failure:", valid)
+          pathlib.Path("evidence/baseline.json").write_text(json.dumps(results, indent=2))
+          if not all(row["expected_failure"] for row in results):
+              raise SystemExit("Baseline did not reproduce all three expected assertion failures")
+          PY
+      - name: Restore candidate
+        if: always()
+        run: git restore --source=HEAD authentik/core/api/applications.py authentik/core/signals.py
+      - name: Run candidate core regression modules
+        run: |
+          set -o pipefail
+          make test authentik.core.tests.test_signals authentik.core.tests.test_applications_api 2>&1 | tee evidence/candidate.log
+      - name: Save provenance
+        if: always()
+        run: |
+          mkdir -p evidence
+          git rev-parse HEAD HEAD^{tree} > evidence/source.txt
+          uv run python --version >> evidence/source.txt
+          git diff --exit-code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: application-cache-login-evidence
+          path: evidence/

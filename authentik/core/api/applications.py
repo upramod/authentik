@@ -342,7 +342,7 @@ class ApplicationViewSet(
                         self.request.user.pk, paginator.page.number, only_with_launch_url
                     ),
                     allowed_applications,
-                    timeout=86400,
+                    timeout=300,
                 )
 
         if only_with_launch_url:

@@ -1,8 +1,10 @@
 """Test core signals"""
 
+from django.core.cache import cache
 from django.test import TestCase
 
 from authentik.blueprints.v1.importer import Importer
+from authentik.core.api.applications import user_app_cache_key
 from authentik.core.models import AuthenticatedSession, Session, User
 from authentik.core.signals import deactivation_inhibit_cleanup
 from authentik.core.tests.utils import create_test_session, create_test_user
@@ -89,3 +91,30 @@ entries:
         user.refresh_from_db()
         self.assertFalse(user.is_active)
         self.assertFalse(Session.objects.filter(session_key=session.session.session_key).exists())
+
+
+class TestLoginApplicationCache(TestCase):
+    """Logging in refreshes all application-list pages for only that user."""
+
+    def test_login_invalidates_application_pages(self):
+        """Clear regular and launcher pages without clearing another user's cache."""
+        user = create_test_user()
+        other_user = create_test_user()
+        keys = [
+            user_app_cache_key(user.pk, page, only_with_launch_url)
+            for page in (1, 2)
+            for only_with_launch_url in (False, True)
+        ]
+        other_key = user_app_cache_key(other_user.pk, 1)
+        # A user whose ID shares a prefix must also remain untouched.
+        prefix_key = user_app_cache_key(f"{user.pk}0", 1)
+        for key in [*keys, other_key, prefix_key]:
+            cache.set(key, "cached", timeout=300)
+            self.addCleanup(cache.delete, key)
+
+        self.client.force_login(user)
+
+        for key in keys:
+            self.assertIsNone(cache.get(key))
+        self.assertEqual(cache.get(other_key), "cached")
+        self.assertEqual(cache.get(prefix_key), "cached")

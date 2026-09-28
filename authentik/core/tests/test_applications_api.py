@@ -1,12 +1,15 @@
 """Test Applications API"""
 
 from json import loads
+from unittest.mock import patch
 
+from django.core.cache import cache
 from django.urls import reverse
 from rest_framework.test import APITestCase
 
-from authentik.core.models import Application
-from authentik.core.tests.utils import create_test_admin_user, create_test_flow
+from authentik.core.api.applications import user_app_cache_key
+from authentik.core.models import Application, Group
+from authentik.core.tests.utils import create_test_admin_user, create_test_flow, create_test_user
 from authentik.lib.generators import generate_id
 from authentik.policies.dummy.models import DummyPolicy
 from authentik.policies.models import PolicyBinding
@@ -260,6 +263,54 @@ class TestApplicationsAPI(APITestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("slug", response.data)
         self.assertIn("reserved", response.data["slug"][0])
+
+
+class TestApplicationCacheLogin(APITestCase):
+    """Application visibility is refreshed when a user logs in again."""
+
+    def test_group_removal_is_visible_after_login(self):
+        """A stale application tile is removed after logout and login."""
+        user = create_test_user()
+        group = Group.objects.create(name=generate_id())
+        user.ak_groups.add(group)
+        application = Application.objects.create(
+            name=generate_id(), slug=generate_id(), meta_launch_url="https://example.test"
+        )
+        PolicyBinding.objects.create(target=application, group=group, order=0)
+        self.client.force_login(user)
+        url = reverse("authentik_api:application-list")
+
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(application.slug, [app["slug"] for app in response.json()["results"]])
+
+        cached_applications = cache.get(user_app_cache_key(user.pk, 1))
+        self.assertIsNotNone(cached_applications)
+        self.assertIn(application, cached_applications)
+
+        user.ak_groups.remove(group)
+        self.client.logout()
+        self.client.force_login(user)
+
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(application.slug, [app["slug"] for app in response.json()["results"]])
+
+    def test_application_list_cache_duration(self):
+        """Application-list entries expire after five minutes."""
+        user = create_test_user()
+        Application.objects.create(
+            name=generate_id(), slug=generate_id(), meta_launch_url="https://example.test"
+        )
+        self.client.force_login(user)
+        with patch("authentik.core.api.applications.cache.set", wraps=cache.set) as set_cache:
+            response = self.client.get(reverse("authentik_api:application-list"))
+        self.assertEqual(response.status_code, 200)
+        application_writes = [
+            call for call in set_cache.call_args_list if "app_access/" in call.args[0]
+        ]
+        self.assertEqual(len(application_writes), 1)
+        self.assertEqual(application_writes[0].kwargs["timeout"], 300)
 
     def test_update_application_with_reserved_slug(self):
         """Test updating an application to use a reserved slug"""
