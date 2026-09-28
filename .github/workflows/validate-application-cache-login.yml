@@ -32,6 +32,7 @@ jobs:
           git show 53d94213e87e32387fad93308713eae0f4711685:authentik/core/signals.py > authentik/core/signals.py
           uv run python - <<'PY'
           import json, pathlib, subprocess
+          import xml.etree.ElementTree as ET
           cases = [
               ("authentik.core.tests.test_signals.TestLoginApplicationCache.test_login_invalidates_application_pages", "'cached' is not None"),
               ("authentik.core.tests.test_applications_api.TestApplicationCacheLogin.test_group_removal_is_visible_after_login", "unexpectedly found in"),
@@ -39,9 +40,25 @@ jobs:
           ]
           results = []
           for case, marker in cases:
+              report = pathlib.Path("unittest.xml")
+              report.unlink(missing_ok=True)
               run = subprocess.run(["uv", "run", "python", "manage.py", "test", "--keepdb", "--noinput", case], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
               pathlib.Path("evidence", case.rsplit(".", 1)[-1] + "-baseline.log").write_text(run.stdout)
-              valid = run.returncode == 1 and marker in run.stdout and "FAIL: " in run.stdout and "FAILED (failures=1)" in run.stdout and "ERROR:" not in run.stdout
+              valid = False
+              if report.exists():
+                  pathlib.Path("evidence", case.rsplit(".", 1)[-1] + "-baseline.xml").write_bytes(report.read_bytes())
+                  root = ET.parse(report).getroot()
+                  cases_xml = root.findall(".//testcase")
+                  failures = root.findall(".//failure")
+                  valid = (
+                      run.returncode == 1
+                      and len(cases_xml) == 1
+                      and cases_xml[0].get("name") == case.rsplit(".", 1)[-1]
+                      and len(failures) == 1
+                      and not root.findall(".//error")
+                      and not root.findall(".//skipped")
+                      and marker in (failures[0].get("message", "") + (failures[0].text or ""))
+                  )
               results.append(dict(test=case, returncode=run.returncode, expected_failure=valid))
               print(case, "expected failure:", valid)
           pathlib.Path("evidence/baseline.json").write_text(json.dumps(results, indent=2))
