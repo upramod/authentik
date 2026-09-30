@@ -48,6 +48,39 @@ class SCIMUserTests(TestCase):
             SCIMMapping.objects.get(managed="goauthentik.io/providers/scim/group")
         )
 
+    def _unchanged_sync_writes(self, mock: Mocker, echo_attributes: bool):
+        """Count writes after two unchanged syncs with only HTTP mocked."""
+        scim_id = generate_id()
+        mock.get("https://localhost/ServiceProviderConfig", json={})
+
+        def response(request, _context):
+            return (request.json() if echo_attributes else {}) | {"id": scim_id}
+
+        create_user = mock.post("https://localhost/Users", json=response)
+        update_user = mock.put(f"https://localhost/Users/{scim_id}", json=response)
+        uid = generate_id()
+        user = User.objects.create(username=uid, name=uid, email=f"{uid}@example.test")
+        self.assertEqual(create_user.call_count, 1)
+        self.assertTrue(
+            SCIMProviderUser.objects.filter(
+                provider=self.provider, user=user, scim_id=scim_id
+            ).exists()
+        )
+        scim_sync.send(self.provider.pk).get_result()
+        scim_sync.send(self.provider.pk).get_result()
+        self.assertEqual(create_user.call_count, 1)
+        return update_user.call_count
+
+    @Mocker()
+    def test_unchanged_sync_partial_response(self, mock: Mocker):
+        """An omitted attribute must not trigger writes on identical syncs."""
+        self.assertEqual(self._unchanged_sync_writes(mock, False), 0)
+
+    @Mocker()
+    def test_unchanged_sync_full_response(self, mock: Mocker):
+        """Control: echoing the sent attributes produces no repeated writes."""
+        self.assertEqual(self._unchanged_sync_writes(mock, True), 0)
+
     @Mocker()
     def test_user_create(self, mock: Mocker):
         """Test user creation"""

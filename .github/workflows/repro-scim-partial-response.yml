@@ -1,0 +1,35 @@
+name: Reproduce SCIM partial-response writes
+on:
+  push:
+    branches: [repro/scim-partial-response-20260929]
+permissions:
+  contents: read
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      POSTGRES_DB: authentik
+      POSTGRES_USER: authentik
+      POSTGRES_PASSWORD: "EK-5jnKfjrGRm<77"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          dependencies: python,runtime
+      - name: Verify regression and control
+        run: uv run python scripts/repro_scim_partial_response.py
+      - name: Record provenance
+        if: always()
+        run: |
+          mkdir -p evidence
+          git rev-parse HEAD HEAD^{tree} > evidence/source.txt
+          git hash-object authentik/providers/scim/clients/users.py >> evidence/source.txt
+          uv run python --version >> evidence/source.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scim-partial-response-reproduction
+          path: evidence/
